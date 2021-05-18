@@ -19,6 +19,7 @@ from typing import Set, Optional, Tuple
 
 import numpy as np
 import torch
+import intel_pytorch_extension as ipex
 from tqdm import trange
 from transformers import AutoModel, TensorType
 
@@ -28,32 +29,32 @@ from config import BenchmarkConfig
 from utils import SEC_TO_NS_SCALE
 
 
-BACKEND_NAME = "pytorch"
+BACKEND_NAME = "ipex"
 LOGGER = getLogger(BACKEND_NAME)
 
 
 @dataclass
-class PyTorchConfig(BackendConfig):
-    name: str = "pytorch"
+class IPEXConfig(BackendConfig):
+    name: str = "ipex"
     use_torchscript: bool = False
 
     @staticmethod
     def version() -> str:
-        return torch.__version__
+        return ipex.__version__
 
     @staticmethod
     def supported_keys() -> Set[str]:
         return BackendConfig.supported_keys().union({"use_torchscript"})
 
 
-class PyTorchBackend(Backend[PyTorchConfig]):
+class IPEXBackend(Backend[IPEXConfig]):
     NAME = BACKEND_NAME
 
     def __init__(self, model: str):
         super().__init__(model)
         self.model = AutoModel.from_pretrained(model)
 
-        LOGGER.info(f"Allocated PyTorch Backend for model: {model}")
+        LOGGER.info(f"Allocated IPEX Backend for model: {model}")
 
     @classmethod
     def allocate(cls, config: BenchmarkConfig):
@@ -62,10 +63,10 @@ class PyTorchBackend(Backend[PyTorchConfig]):
 
         return backend
 
-    def configure(self, config: PyTorchConfig):
+    def configure(self, config: IPEXConfig):
         super().configure(config)
 
-        LOGGER.info("Configuring PyTorch Benchmark:")
+        LOGGER.info("Configuring IPEX Benchmark:")
 
         # Disable gradients
         torch.set_grad_enabled(False)
@@ -92,19 +93,19 @@ class PyTorchBackend(Backend[PyTorchConfig]):
 
         if config.use_torchscript:
             self.model.config.return_dict = False
-            LOGGER.info("\t+ Disabling dictionary output for TorchScript")
+            LOGGER.info("\t+ Disabling dictionary output for IPEXTorchScript")
 
     def execute(self, config: BenchmarkConfig, is_reference: bool = False) -> Tuple[Benchmark, np.ndarray]:
         if config.backend.use_torchscript:
-            return self._run_torchscript(config, is_reference)
+            return self._run_ipextorchscript(config, is_reference)
         else:
-            return self._run_pytorch(config, is_reference)
+            return self._run_ipex(config, is_reference)
 
-    def _run_pytorch(self, config: BenchmarkConfig, is_reference: bool) -> Tuple[Benchmark, np.ndarray]:
+    def _run_ipex(self, config: BenchmarkConfig, is_reference: bool) -> Tuple[Benchmark, np.ndarray]:
         """
         :return:
         """
-        LOGGER.info("Running PyTorch Eager benchmark")
+        LOGGER.info("Running IPEX Eager benchmark")
         benchmark = Benchmark()
 
         dummy_inputs = self._get_dummy_inputs(
@@ -126,7 +127,7 @@ class PyTorchBackend(Backend[PyTorchConfig]):
             # Warmup
             for _ in trange(config.warmup_runs, desc="Warming up"):
                 output = self.model(**inputs)
-                outputs.append(output.last_hidden_state.numpy())
+                outputs.append(output.last_hidden_state.to('cpu').numpy())
 
             # Let's not run the benchmark for the reference backend,
             # as we are more interested in the output tensors.
@@ -142,7 +143,7 @@ class PyTorchBackend(Backend[PyTorchConfig]):
 
         return benchmark, np.stack(outputs)
 
-    def _run_torchscript(self, config: BenchmarkConfig, is_reference: bool) -> Tuple[Benchmark, np.ndarray]:
+    def _run_ipextorchscript(self, config: BenchmarkConfig, is_reference: bool) -> Tuple[Benchmark, np.ndarray]:
         """
         :return:
         """
@@ -178,7 +179,7 @@ class PyTorchBackend(Backend[PyTorchConfig]):
             with torch.jit.optimized_execution(True):
                 for _ in trange(config.warmup_runs, desc="Warming up"):
                     output = model_scripted(*ordered_inputs.values())
-                    outputs.append(output[0].numpy())
+                    outputs.append(output[0].to('cpu').numpy())
 
                 # Let's not run the benchmark for the reference backend,
                 # as we are more interested in the output tensors.
