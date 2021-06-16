@@ -33,10 +33,40 @@ BACKEND_NAME = "pytorch"
 LOGGER = getLogger(BACKEND_NAME)
 
 
+class CUDABenchmark(Benchmark):
+    def __init__(self):
+        super().__init__()
+
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA is not available")
+
+    @contextmanager
+    def track(self):
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+
+        start_event.record()
+        yield
+
+        end_event.record()
+        torch.cuda.synchronize()  # Wait for the events to be recorded!
+
+        # Get timing events
+        latency_ms = start_event.elapsed_time(end_event)
+
+        # Convert to nanoseconds to match Benchmark.track()
+        latency_ns = latency_ms * 1_000_000
+
+        # Append the time to the buffer
+        self.latencies.append(latency_ns)
+
+        LOGGER.debug(f"Tracked function took: {latency_ns}ns ({latency_ms:.3f}ms)")
+
 @dataclass
 class PyTorchConfig(BackendConfig):
     name: str = "pytorch"
     use_torchscript: bool = False
+    use_tf32: bool = False
 
     @staticmethod
     def version() -> str:
@@ -44,7 +74,7 @@ class PyTorchConfig(BackendConfig):
 
     @staticmethod
     def supported_keys() -> Set[str]:
-        return BackendConfig.supported_keys().union({"use_torchscript"})
+        return BackendConfig.supported_keys().union({"use_torchscript", "use_tf32"})
 
 
 class PyTorchBackend(Backend[PyTorchConfig]):
@@ -72,6 +102,19 @@ class PyTorchBackend(Backend[PyTorchConfig]):
         # Disable gradients
         torch.set_grad_enabled(False)
         LOGGER.info("\t+ Disabled gradients")
+
+        # Tune Nvidia's TF32 support
+        if torch.has_cuda and torch.cuda.is_available():
+            if hasattr(torch.backends.cuda, "matmul") and hasattr(torch.backends.cuda.matmul, "allow_tf32"):
+                torch.backends.cuda.matmul.allow_tf32 = config.use_tf32
+                LOGGER.info(f"\t+ CUDA allows Nvidia's TF32: { torch.backends.cuda.matmul.allow_tf32 }")
+
+        if torch.has_cudnn and torch.backends.cudnn.is_available():
+
+            if hasattr(torch.backends.cudnn, "allow_tf32"):
+                # The flag below controls whether to allow TF32 on cuDNN.
+                torch.backends.cudnn.allow_tf32 = config.use_tf32
+                LOGGER.info(f"\t+ CuDNN allows Nvidia's TF32: { torch.backends.cudnn.allow_tf32 }")
 
         self.model.eval()
         LOGGER.info("\t+ Turning eval mode on Module (model.eval())")
@@ -111,7 +154,7 @@ class PyTorchBackend(Backend[PyTorchConfig]):
         """
         LOGGER.info("Running PyTorch Eager benchmark")
         itt.task_begin(self.domain, '_run_pytorch')
-        benchmark = Benchmark()
+        benchmark = CUDABenchmark() if config.device == "cuda" else Benchmark()
 
         dummy_inputs = self._get_dummy_inputs(
             batch_size=config.batch_size,
@@ -130,11 +173,12 @@ class PyTorchBackend(Backend[PyTorchConfig]):
 
         with torch.no_grad():
             # Warmup
-            for i in trange(config.warmup_runs, desc="Warming up"):
-                itt.task_begin(self.domain, 'warmup_{}'.format(i))
-                output = self.model(**inputs)
-                itt.task_end(self.domain)
-                outputs.append(output.last_hidden_state.numpy())
+            with torch.cuda.amp.autocast(config.precision == "float16"):
+                for i in trange(config.warmup_runs, desc="Warming up"):
+                    itt.task_begin(self.domain, 'warmup_{}'.format(i))
+                    output = self.model(**inputs)
+                    itt.task_end(self.domain)
+                    outputs.append(output.last_hidden_state.cpu().numpy())
 
             # Let's not run the benchmark for the reference backend,
             # as we are more interested in the output tensors.
@@ -142,17 +186,18 @@ class PyTorchBackend(Backend[PyTorchConfig]):
 
                 # Run benchmark
                 benchmark_duration_ns = config.benchmark_duration * SEC_TO_NS_SCALE
-                index = 0
-                while sum(benchmark.latencies) < benchmark_duration_ns:
-                    with benchmark.track():
-                        #itt.task_begin(self.domain, 'measure_{}'.format(index))
-                        #self.model(**inputs)
-                        #itt.task_end(self.domain)
-                        with torch.autograd.profiler.profile(record_shapes=True) as prof:
-                            self.model(**inputs)
-                        with open('torch_{:04d}.txt'.format(index), 'w') as f:
-                            f.write(prof.key_averages().table(sort_by="self_cpu_time_total"))
-                    index = index + 1
+                with torch.cuda.amp.autocast(config.precision == "float16"):
+                    index = 0
+                    while sum(benchmark.latencies) < benchmark_duration_ns:
+                        with benchmark.track():
+                            #itt.task_begin(self.domain, 'measure_{}'.format(index))
+                            #self.model(**inputs)
+                            #itt.task_end(self.domain)
+                            with torch.autograd.profiler.profile(record_shapes=True) as prof:
+                                self.model(**inputs)
+                            with open('torch_{:04d}.txt'.format(index), 'w') as f:
+                                f.write(prof.key_averages().table(sort_by="self_cpu_time_total"))
+                        index = index + 1
 
                 benchmark.finalize(benchmark_duration_ns)
         itt.task_end(self.domain)
@@ -165,7 +210,7 @@ class PyTorchBackend(Backend[PyTorchConfig]):
         """
         LOGGER.info("Running TorchScript benchmark")
         itt.task_begin(self.domain, '_run_torchscript')
-        benchmark = Benchmark()
+        benchmark = CUDABenchmark() if config.device == "cuda" else Benchmark()
 
         dummy_inputs = self._get_dummy_inputs(
             batch_size=config.batch_size,
@@ -196,11 +241,12 @@ class PyTorchBackend(Backend[PyTorchConfig]):
             itt.task_end(self.domain)
 
             with torch.jit.optimized_execution(True):
-                for i in trange(config.warmup_runs, desc="Warming up"):
-                    itt.task_begin(self.domain, 'warmup_{}'.format(i))
-                    output = model_scripted(*ordered_inputs.values())
-                    itt.task_end(self.domain)
-                    outputs.append(output[0].numpy())
+                with torch.cuda.amp.autocast(config.precision == "float16"):
+                    for i in trange(config.warmup_runs, desc="Warming up"):
+                        itt.task_begin(self.domain, 'warmup_{}'.format(i))
+                        output = model_scripted(*ordered_inputs.values())
+                        itt.task_end(self.domain)
+                        outputs.append(output[0].numpy())
 
                 # Let's not run the benchmark for the reference backend,
                 # as we are more interested in the output tensors.
@@ -208,17 +254,18 @@ class PyTorchBackend(Backend[PyTorchConfig]):
 
                     # Run benchmark
                     benchmark_duration_ns = config.benchmark_duration * SEC_TO_NS_SCALE
-                    index = 0
-                    while sum(benchmark.latencies) < benchmark_duration_ns:
-                        with benchmark.track():
-                            #itt.task_begin(self.domain, 'measure_{}'.format(index))
-                            #model_scripted(*ordered_inputs.values())
-                            #itt.task_end(self.domain)
-                            with torch.autograd.profiler.profile(record_shapes=True) as prof:
-                                model_scripted(*ordered_inputs.values())
-                            with open('torchscript_{:04d}.txt'.format(index), 'w') as f:
-                                f.write(prof.key_averages().table(sort_by="self_cpu_time_total"))
-                        index = index + 1
+                    with torch.cuda.amp.autocast(config.precision == "float16"):
+                        index = 0
+                        while sum(benchmark.latencies) < benchmark_duration_ns:
+                            with benchmark.track():
+                                #itt.task_begin(self.domain, 'measure_{}'.format(index))
+                                #model_scripted(*ordered_inputs.values())
+                                #itt.task_end(self.domain)
+                                with torch.autograd.profiler.profile(record_shapes=True) as prof:
+                                    model_scripted(*ordered_inputs.values())
+                                with open('torchscript_{:04d}.txt'.format(index), 'w') as f:
+                                    f.write(prof.key_averages().table(sort_by="self_cpu_time_total"))
+                            index = index + 1
 
                     benchmark.finalize(benchmark_duration_ns)
         itt.task_end(self.domain)
